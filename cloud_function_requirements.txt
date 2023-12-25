@@ -1,0 +1,13 @@
+functions-framework==3.*
+pymssql~=2.2.11
+pandas~=2.0.3
+pyarrow~=12.0.1
+fsspec~=2023.1.0
+gcsfs~=2023.1.0
+numpy~=1.21.6
+pyodbc~=5.0.1
+sqlalchemy~=2.0.23
+google-cloud-storage~=2.12.0
+google-cloud-bigquery~=3.12.0
+google-cloud-pubsub~=2.18.4
+google-cloud-logging~=3.8.0
