@@ -1,0 +1,160 @@
+from __future__ import annotations
+from datetime import datetime, timedelta
+import pandas as pd
+import logging
+import sqlalchemy as sal
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.operators.empty import EmptyOperator
+
+from google.cloud import storage
+
+processed_bucket_name = "nrdb_datafeed_processed_files"
+
+
+def storage_client():
+    # Create a GCS storage client
+    storage_client = storage.Client()
+    return storage_client
+
+
+def load_to_mssql(df):
+    try:
+        print("Starting insert process")
+        strt_ts = datetime.now()
+        chunk_size = 2500
+        print(f"Total rows present in df: {len(df)}")
+        approx_total_chunks_to_proceed = ((len(df) // chunk_size) + 1)
+        print(f"approx_total_chunks_to_proceed: {approx_total_chunks_to_proceed}")
+        engine = sal.create_engine("mssql+pymssql://nrdbdatafeedloader:08737GuMIr3yNjKc9S1D@10.195.32.21:8033/WEB")
+        print("Engine set up done")
+        count = pd.read_sql('Select count(*) from WEB.Changesubscription.PhoneChanges', engine)
+        print(f"count from DB before data dump is: {count}")
+        # Iterate through the DataFrame in chunks
+        for chunk_start in range(0, len(df), chunk_size):
+            chunk_end = chunk_start + chunk_size
+            chunk = df.iloc[chunk_start:chunk_end]
+            print(f"Processing Chunk {chunk_start // chunk_size + 1}")
+            chunk.to_sql('PhoneChanges', con=engine, schema='Changesubscription', method=None, index=False,
+                         if_exists='append')
+            print(f" Chunk {chunk_start // chunk_size + 1} processed successfully")
+            # df.to_sql('PhoneChanges',con=engine,schema='Changesubscription',method=None,chunksize=1,index=False,if_exists='append')
+        end_ts = datetime.now()
+        count = pd.read_sql('Select count(*) from WEB.Changesubscription.PhoneChanges', engine)
+        print(f"count from DB after data dump is: {count}")
+        print("CSV file loaded to MS Sql server sucessfully")
+        print("The execution time for data load=", (end_ts - strt_ts).total_seconds())
+    except Exception as exception:
+        logging.error(
+            "An exception occurred  in load to MSSQL DB"
+        )
+        logging.error("Exception occurred due to %s", str(exception))
+        raise exception
+    return "success"
+
+
+def check_files_in_bucket(processed_bucket_name):
+    try:
+        client = storage_client()
+        bucket = client.bucket(processed_bucket_name)
+        filenames = bucket.list_blobs(prefix="cloud_function_processed_csv")
+        files = [filename.name for filename in filenames if filename.name.endswith("cf_processed.csv")]
+        if len(files) > 0:
+            return "read_file_name_from_bucket"
+        else:
+            return "no_files_present_in_gcs_bucket"
+
+    except Exception as exception:
+        logging.error("An exception occurred in "
+                      "[check_files_in_bucket]")
+        logging.error("Exception occurred due to %s", str(exception))
+        raise exception
+
+
+def read_file_name_from_bucket(**kwargs):
+    ti = kwargs["ti"]
+    client = storage_client()
+    bucket = client.bucket(processed_bucket_name)
+    filenames = bucket.list_blobs(prefix="cloud_function_processed_csv")
+    files = [filename.name for filename in filenames if filename.name.endswith("cf_processed.csv")]
+    print(f"filenames are : {files}")
+    # for file in files:
+
+    file = files[0]
+    kwargs['ti'].xcom_push(key="file_path", value=file)
+
+
+def process_file_to_mssql(processed_bucket_name, **kwargs):
+    ti = kwargs["ti"]
+    file_path = ti.xcom_pull(task_ids="read_file_name_from_bucket", key="file_path")
+
+    df = pd.read_csv(f"gs://{processed_bucket_name}/{file_path}")
+    load_to_mssql(df)
+
+
+def delete_processed_gcs_files(processed_bucket_name, **kwargs):
+    ti = kwargs["ti"]
+    file_path = ti.xcom_pull(task_ids="read_file_name_from_bucket", key="file_path")
+    client = storage_client()
+    bucket = client.bucket(processed_bucket_name)
+
+    # destination_path = f"composer_processed_csv/{file_path.split('/')[1]}"
+    # print(f"destination_path:{destination_path}")
+    source_blob = bucket.blob(file_path)
+    # destination_blob = bucket.copy_blob(source_blob, bucket, destination_path)
+    source_blob.delete()
+    print(f"CSV file {file_path} has been deleted from bucket {processed_bucket_name}")
+
+
+# This DAG will run minutely and handle pub/sub messages by triggering target DAG
+with DAG(
+        "gcs_to_mssql",
+        start_date=datetime(2021, 1, 1),
+        # schedule_interval="*/30 * * * *",
+        max_active_runs=1,
+        catchup=False,
+) as trigger_dag:
+    # If subscription exists, we will use it. If not - create new one
+    start = EmptyOperator(task_id="start")
+    no_files_present_in_gcs_bucket = EmptyOperator(task_id="no_files_present_in_gcs_bucket")
+
+    check_files_in_bucket = BranchPythonOperator(
+        task_id="checking_files_in_bucket",
+        op_kwargs={"processed_bucket_name": processed_bucket_name
+                   },
+        python_callable=check_files_in_bucket,
+        do_xcom_push=False,
+    )
+
+    read_file_name_from_bucket = PythonOperator(
+        task_id="read_file_name_from_bucket",
+        python_callable=read_file_name_from_bucket,
+        do_xcom_push=True,
+    )
+
+    process_file_to_mssql = PythonOperator(
+        task_id="process_file_to_mssql",
+        python_callable=process_file_to_mssql,
+        execution_timeout=timedelta(hours=3),
+        op_kwargs={"processed_bucket_name": processed_bucket_name
+                   },
+        do_xcom_push=False, )
+
+    delete_processed_gcs_files = PythonOperator(
+        task_id="delete_processed_gcs_files",
+        python_callable=delete_processed_gcs_files,
+        execution_timeout=timedelta(minutes=10),
+        op_kwargs={"processed_bucket_name": processed_bucket_name
+                   },
+        do_xcom_push=False,
+    )
+
+    end = EmptyOperator(task_id="end")
+
+    start.set_downstream(check_files_in_bucket)
+    check_files_in_bucket.set_downstream(no_files_present_in_gcs_bucket)
+    check_files_in_bucket.set_downstream(read_file_name_from_bucket)
+    read_file_name_from_bucket.set_downstream(process_file_to_mssql)
+    process_file_to_mssql.set_downstream(delete_processed_gcs_files)
+    delete_processed_gcs_files.set_downstream(end)

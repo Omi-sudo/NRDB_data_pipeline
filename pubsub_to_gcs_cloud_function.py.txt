@@ -1,0 +1,196 @@
+import base64
+import functions_framework
+import json
+import logging
+import sys
+import time
+import pandas as pd
+import numpy as np
+import pymssql
+import pyodbc
+import sqlalchemy as sal
+from datetime import datetime
+from pyarrow import parquet
+from io import BytesIO
+from pytz import timezone
+from datetime import datetime
+
+
+
+from google.cloud import storage
+
+
+logging.basicConfig(level=logging.INFO)
+time_object = datetime.utcnow()
+formatted_time = time_object.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+processed_bucket_name = "nrdb_datafeed_processed_files"
+# Create a GCS storage client
+storage_client = storage.Client()
+
+
+# formatted_time = datetime.strptime(formatted_time, "%Y-%m-%d %H:%M:%S.%f"
+
+def get_parquet_file_names(bucket_name, path):
+    # Get a list of files in the specified folder
+    bucket = storage_client.bucket(bucket_name)
+    files = []
+    blobs = bucket.list_blobs(prefix=path)
+    for blob in blobs:
+        files.append(blob.name)
+    # Print the list of files
+    print(f"list of files present in folder are : {files}")
+
+    # Filter files with the '.parquet' postfix
+    parquet_files = [file for file in files if file.endswith('.parquet')]
+    print(f"Parquet files present in bucket: {parquet_files}")
+    return parquet_files
+
+
+def filtered_files_to_processed(parquet_files, processed_bucket_name):
+    gcs_file_names = pd.read_csv(f"gs://{processed_bucket_name}/processed.csv")
+    final_files_to_processed = []
+    print(gcs_file_names)
+    for filename in parquet_files:
+        if filename not in gcs_file_names.values:
+            print(f"data for {filename} is not present in processed.csv hence processing further")
+            final_files_to_processed.append(filename)
+        else:
+            print(f"data for {filename} is present in processed.csv hence not processing further")
+    return final_files_to_processed
+
+
+def read_data_from_bucket(bucket_name, parquet_files):
+    """
+        Read multiple Parquet files from GCS and concatenate them into a single DataFrame.
+
+        Parameters:
+        - bucket_name: Name of the GCS bucket.
+        - file_prefixes: List of file prefixes for Parquet files in GCS.
+
+        Returns:
+        - A pandas DataFrame containing the concatenated data.
+        """
+
+    # Create a GCS client
+    client = storage.Client()
+
+    # Initialize an empty DataFrame to store the concatenated data
+    combined_df = pd.DataFrame()
+    print(f"parquet files are: {parquet_files}")
+    for file_prefix in parquet_files:
+        # Get a list of files in the GCS bucket with the specified prefix
+        blobs = client.list_blobs(bucket_name, prefix=file_prefix)
+
+        # Iterate over the files and read each Parquet file
+        for blob in blobs:
+            # Download the Parquet file as bytes
+            file_content = BytesIO(blob.download_as_bytes())
+
+            # Read the Parquet file into a DataFrame
+            parquet_df = parquet.read_table(file_content).to_pandas()
+
+            # Concatenate the DataFrame to the combined DataFrame
+            combined_df = pd.concat([combined_df, parquet_df], ignore_index=True)
+    print(f"combined dataframe is: {combined_df}")
+
+    return combined_df
+
+
+def process_data(bucket_name, df):
+    try:
+        # for disconnect data
+        global final_dataframe
+
+        if bucket_name == "2ccba9aa-7104-4487-9922-d2774c7ac8bd-4111-a":
+            # For phone name change data
+            print("Processing Phone name changes data")
+            # processing logic
+            df2 = df[(df['type'].apply(str.lower) == 'c') | (df['bus_res_ind'].apply(str.lower) == 'c')].copy()
+            print(f"df2 is ; {df2}")
+            df2['Phone'] = df2['tn'].str.replace('[^0-9]', '', regex=True).str.lstrip('0')
+            df2['Timestamp'] = formatted_time
+            df2['SourceDbId'] = 11
+            df2['ChangeTypeId'] = 8
+            df2['ChangeContext'] = np.nan
+            df2['Value'] = np.nan
+
+            final_dataframe = df2[['Phone', 'Timestamp', 'SourceDbId', 'ChangeTypeId', 'ChangeContext', 'Value']]
+
+        else:
+            print("Processing Disconnect data")
+            # Processing Disconnect data
+            df['Phone'] = df['tn'].str.replace('[^0-9]', '', regex=True).str.lstrip('0')
+            df['Timestamp'] = formatted_time
+            df['SourceDbId'] = 11
+            df['ChangeTypeId'] = 21
+            df['ChangeContext'] = np.nan
+            df['Value'] = 'Y'
+
+            final_dataframe = df[['Phone', 'Timestamp', 'SourceDbId', 'ChangeTypeId', 'ChangeContext', 'Value']]
+
+        # final df to dumped in sql server
+        # final_dataframe['Id'] = range(1, len(final_dataframe) + 1)
+        print(f"final dataframe is: {final_dataframe}")
+
+    except Exception as exception:
+        logging.error(
+            "An exception occurred  in [process_data]"
+        )
+        logging.error("Exception occurred due to %s", str(exception))
+        raise exception
+    return final_dataframe
+
+
+def store_dataframe_as_csv(df, bucket_name):
+    """Stores a DataFrame as a CSV file in a Cloud Storage bucket.
+
+    Args:
+        df: The DataFrame to store.
+        bucket_name: The name of the Cloud Storage bucket.
+        file_path: The path to the file in the bucket, including the filename.
+    """
+
+    bucket = storage_client.bucket(bucket_name)
+
+    ind_time = datetime.now(timezone("Asia/Kolkata")).strftime('%Y-%m-%d %H:%M:%S.%f')
+    file_path= f"cloud_function_processed_csv/{ind_time}_cf_processed.csv"
+
+    csv_buffer = df.to_csv(index=False)  # Convert DataFrame to CSV string
+    blob = bucket.blob(file_path)
+    blob.upload_from_string(csv_buffer, content_type='text/csv')  # Upload to Cloud Storage
+
+    print(f"CSV file uploaded to: gs://{bucket_name}/{file_path}")
+
+
+@functions_framework.cloud_event
+def my_pubsub_function(cloud_event):
+    time1 = time.perf_counter()
+    # Print out the data from Pub/Sub, to prove that it worked
+    pubsub_decoded_message = base64.b64decode(cloud_event.data["message"]["data"]).decode('utf-8')
+    readable_decoded_message = base64.b64decode(pubsub_decoded_message).decode('utf-8')
+    print(f"readable decoded msg is: {readable_decoded_message}")
+    try:
+        # Deserialize the message data into a JSON object
+        message_data = json.loads(readable_decoded_message)
+        print(f"message data is: {message_data} ")
+        target_location = message_data['target_location']
+        bucket_name = (target_location.lstrip('gs://')).split("/")[0]
+        print(f"bucket_name is:{bucket_name}")
+        _, _, path = target_location.lstrip('gs://').partition('/')
+        print(f"prefix is: {path}")
+
+        parquet_files = get_parquet_file_names(bucket_name, path)
+        filtered_files = filtered_files_to_processed(parquet_files, processed_bucket_name)
+        print(f"final_files_to_processed : {filtered_files}")
+        df = read_data_from_bucket(bucket_name, filtered_files)
+        dataframe = process_data(bucket_name, df)
+        store_dataframe_as_csv(dataframe, processed_bucket_name)
+        time2 = time.perf_counter()
+        required_time_for_execution = time2 - time1
+        print(f"Time required for execution of function : {required_time_for_execution} seconds")
+        print("Pipeline execution completed")
+
+    except Exception as exception:
+        logging.error("An exception occurred  in [my_pubsub_function]")
+        logging.error("Exception occurred due to %s", str(exception))
+        raise exception
